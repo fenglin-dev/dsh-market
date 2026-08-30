@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Process layer: re-invoking the dsh CLI that launched this host, spawning
  * `dsh plugin` commands with timeouts and live progress, and provisioning
  * pnpm. This is the only module that starts child processes.
@@ -824,38 +824,90 @@ function makeProgressFeeder(tracker: ReturnType<typeof createProgressTracker>): 
 /**
  * Remove stale pnpm temp directories from node_modules before install.
  *
- * pnpm sometimes leaves `*_tmp_*` directories after a failed or interrupted
- * install (observed on Windows 10 22H2 with native modules like node-hid).
- * On the next install, pnpm tries to rename the temp dir into place and fails
- * with EPERM: operation not permitted, rename '..._tmp_...' -> '...'.
+ * pnpm sometimes leaves `<name>_tmp_<pid>_<threadId>` directories after a
+ * failed or interrupted install (observed on Windows 10 22H2 with native
+ * modules like node-hid). On the next install, pnpm tries to rename the temp
+ * dir into place and fails with EPERM: operation not permitted, rename
+ * '..._tmp_...' -> '...'.
  *
- * Scanning and removing these stale dirs before each install is a defensive
- * fix that makes the retry path work without manual intervention.
+ * pnpm's fastPathTemp places these as siblings of the target package, which
+ * lives under `node_modules/.pnpm/<pkg>@<ver>/node_modules/` — three levels
+ * deeper than the top-level `node_modules`. This function walks the `.pnpm`
+ * tree so those temp dirs are actually found.
+ *
+ * Only dirs matching pnpm's exact `<name>_tmp_<pid>_<n>` shape are considered,
+ * and a temp dir whose pid still belongs to a live process is left alone: pnpm
+ * embeds the pid precisely so concurrent installs do not clobber each other, and
+ * the desktop host plus a user-run `pnpm` can legitimately coexist on Windows.
+ *
+ * Scanning and removing only genuinely stale dirs before each install is a
+ * defensive fix that makes the retry path work without manual intervention.
  */
-function cleanupTmpDirsInNodeModules(profileDirectory: string): void {
-  const nodeModulesDir = join(profileDirectory, 'node_modules')
-  if (!existsSync(nodeModulesDir)) return
-  let cleaned = 0
+export function cleanupTmpDirsInNodeModules(profileDirectory: string): void {
+  const pnpmDir = join(profileDirectory, 'node_modules', '.pnpm')
+  if (!existsSync(pnpmDir)) return
+  const TMP_DIR_RE = /^(.+)_tmp_(\d+)_(\d+)$/
+  const livePids = new Set<number>()
   try {
-    const entries = readdirSync(nodeModulesDir)
-    for (const name of entries) {
-      if (name.includes('_tmp_')) {
-        const tmpPath = join(nodeModulesDir, name)
-        try {
-          rmSync(tmpPath, { recursive: true, force: true })
-          cleaned++
-        } catch (e) {
-          logEvent('warn', 'install', `failed to remove stale tmp dir ${name}: ${(e as Error).message}`)
+    if (process.platform === 'win32') {
+      const { execSync } = require('node:child_process') as typeof import('node:child_process')
+      const out = execSync('tasklist /FO CSV /NH', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      for (const line of out.split(/\r?\n/)) {
+        const m = /^"[^"]+","(\d+)",/.exec(line)
+        if (m) livePids.add(Number(m[1]))
+      }
+    }
+  } catch {
+    // Probe per-candidate below instead; an empty set is safe.
+  }
+  const isPidAlive = (pid: number): boolean => {
+    if (livePids.size > 0) return livePids.has(pid)
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+  let cleaned = 0
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 4) return
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        const m = TMP_DIR_RE.exec(entry.name)
+        if (m) {
+          const pid = Number(m[2])
+          if (!isPidAlive(pid)) {
+            try {
+              rmSync(full, { recursive: true, force: true })
+              cleaned++
+            } catch (e) {
+              logEvent('warn', 'install', `failed to remove stale tmp dir ${entry.name}: ${(e as Error).message}`)
+            }
+          }
+        } else {
+          walk(full, depth + 1)
         }
       }
     }
+  }
+  try {
+    walk(pnpmDir, 0)
     if (cleaned > 0) {
-      logEvent('info', 'install', `cleaned up ${cleaned} stale tmp dir(s) in node_modules to prevent EPERM rename failures`)
+      logEvent('info', 'install', `cleaned up ${cleaned} stale pnpm tmp dir(s) under node_modules/.pnpm to prevent EPERM rename failures`)
     }
   } catch (err) {
-    logEvent('warn', 'install', `failed to scan node_modules for tmp dirs: ${(err as Error).message}`)
+    logEvent('warn', 'install', `failed to scan .pnpm for tmp dirs: ${(err as Error).message}`)
   }
 }
+
 /** Run one `dsh plugin --profile <p> …` command with timeout and progress tracking. */
 export function runDshPlugin(profile: string, pluginArgs: string[]): Promise<InstallResult> {
   const { file, args, cwd, viaShell } = dshArgv()
